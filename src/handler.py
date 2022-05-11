@@ -59,12 +59,45 @@ def _get_license_key(license_key=None):
         return license_key
     return os.getenv("LICENSE_KEY", "")
 
+def _get_newrelic_tags(payload):
+    """
+    This functions gets New Relic's tags from env vars and adds it to the payload
+    A tag is a key value pair. Multiple tags can be specified.
+    Key and value are colon delimited. Multiple key value pairs are semi-colon delimited.
+    e.g. env:prod;team:myTeam
+    """
+    nr_tags_str = os.getenv("NR_TAGS", "")
+    nr_delimiter = os.getenv("NR_ENV_DELIMITER", ";")
+    if nr_tags_str:
+        nr_tags = dict(
+            item.split(":")
+            for item in nr_tags_str.split(nr_delimiter)
+            if not item.startswith(tuple(["aws:", "plugin:"]))
+        )
+        payload[0]["common"]["attributes"].update(nr_tags)
 
-def _get_log_type(log_type=None):
+def _get_log_type_map():
+    """
+    This function gets the NewRelic logtypemap from env vars.
+    """
+
+    log_type_map = {}
+
+    unparsed_logtype_map = os.getenv("LOG_TYPE_MAP", "")
+
+    for logtype in unparsed_logtype_map.split(","):
+        folder, ltype = logtype.split("=")
+        log_type_map[folder] = ltype
+
+    return log_type_map
+
+def _get_log_type(s3_folder, log_type=None):
     """
     This functions gets the New Relic logtype from env vars.
     """
-    return log_type or os.getenv("LOG_TYPE") or os.getenv("LOGTYPE", "")
+    log_type_map = _get_log_type_map()
+    
+    return log_type_map.get(s3_folder) or log_type or os.getenv("LOG_TYPE") or os.getenv("LOGTYPE", "")
 
 
 def _setting_console_logging_level():
@@ -105,7 +138,7 @@ def _compress_payload(data):
     return payload
 
 
-def _package_log_payload(data):
+def _package_log_payload(data, s3_folder):
     """
     Packages up a MELT request for log messages
     """
@@ -121,11 +154,15 @@ def _package_log_payload(data):
                     "plugin": LOGGING_PLUGIN_METADATA,
                     "aws": {
                         "invoked_function_arn": data["context"]["invoked_function_arn"],
-                        "s3_bucket_name": data["context"]["s3_bucket_name"]},
-                    "logtype": _get_log_type()
+                        "s3_bucket_name": data["context"]["s3_bucket_name"],
+                        "s3_bucket_folder": data["context"]["s3_bucket_folder"]},
+                    "logtype": _get_log_type(s3_folder)
                 }},
             "logs": log_messages,
         }]
+
+    _get_newrelic_tags(packaged_payload)
+
     return packaged_payload
 
 
@@ -184,8 +221,8 @@ async def send_log(session, url, data, headers):
     raise MaxRetriesException()
 
 
-def create_log_payload_request(data, session):
-    payload = _package_log_payload(data)
+def create_log_payload_request(data, session, s3_folder):
+    payload = _package_log_payload(data, s3_folder)
     payload = _compress_payload(payload)
     req = create_request(payload)
     return send_log(session, req.get_full_url(), req.data, req.headers)
@@ -203,9 +240,12 @@ async def _fetch_data_from_s3(bucket, key, context):
             "The log file uploaded to S3 is larger than the supported max size of 400MB")
         return
 
+    s3_folder = key.split("/")[0]
+
     s3MetaData = {
         "invoked_function_arn": context.invoked_function_arn,
-        "s3_bucket_name": bucket
+        "s3_bucket_name": bucket,
+        "s3_bucket_folder": s3_folder
     }
     log_file_url = "s3://{}/{}".format(bucket, key)
     async with aiohttp.ClientSession() as session:
@@ -230,14 +270,14 @@ async def _fetch_data_from_s3(bucket, key, context):
                 if asizeof.asizeof(log_batches) > (MAX_BATCH_SIZE * BATCH_SIZE_FACTOR):
                     logger.debug(f"sending batch: {batch_counter}")
                     data = {"context": s3MetaData, "entry": log_batches}
-                    batch_request.append(create_log_payload_request(data, session))
+                    batch_request.append(create_log_payload_request(data, session, s3_folder))
                     if len(batch_request) >= REQUEST_BATCH_SIZE:
                         await asyncio.gather(*batch_request)
                         batch_request = []
                     log_batches = []
                     batch_counter += 1
         data = {"context": s3MetaData, "entry": log_batches}
-        batch_request.append(create_log_payload_request(data, session))
+        batch_request.append(create_log_payload_request(data, session, s3_folder))
         logger.info("Sending data to NR logs.....")
         output = await asyncio.gather(*batch_request)
         end = time.time()
